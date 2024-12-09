@@ -183,11 +183,13 @@ class LiftLowerContext:
   opts: CanonicalOptions
   inst: ComponentInstance
   borrow_scope: Optional[Task|Subtask]
+  waitable_set: Optional[WaitableSet]
 
-  def __init__(self, opts, inst, borrow_scope = None):
+  def __init__(self, opts, inst, borrow_scope = None, waitable_set = None):
     self.opts = opts
     self.inst = inst
     self.borrow_scope = borrow_scope
+    self.waitable_set = waitable_set
 
 
 ### Canonical ABI Options
@@ -206,7 +208,8 @@ class CanonicalOptions:
 
 class ComponentInstance:
   resources: Table[ResourceHandle]
-  waitables: Table[Subtask|StreamHandle|FutureHandle]
+  waitables: Table[Waitable]
+  waitable_sets: Table[WaitableSet]
   error_contexts: Table[ErrorContext]
   num_tasks: int
   may_leave: bool
@@ -290,7 +293,7 @@ class ResourceType(Type):
     self.dtor_sync = dtor_sync
     self.dtor_callback = dtor_callback
 
-#### Task State
+#### Waitable State
 
 class CallState(IntEnum):
   STARTING = 0
@@ -309,6 +312,74 @@ class EventCode(IntEnum):
 
 EventTuple = tuple[EventCode, int, int]
 EventCallback = Callable[[], Optional[EventTuple]]
+
+class Waitable:
+  waitable_set: Optional[WaitableSet]
+
+  def __init__(self):
+    self.waitable_set = None
+
+  def init_waitable_set(waitable_set):
+    assert(not self.waitable_set)
+    self.waitable_set = waitable_set
+    self.waitable_set.num_waitables += 1
+
+  def enqueue(self, event_cb: EventCallback):
+    self.waitable_set.events.append((self, event_cb))
+    self.waitable_set.has_event.set()
+
+  def maybe_dequeue(self) -> Optional[EventCallback]:
+    if (match := [(i,e) for i,(w,e) in enumerate(self.waitable_set.events) if self is w]):
+      [i, event_cb] = match
+      del self.waitable_set.events[i]
+      return event_cb
+    return None
+
+  def move(self, to):
+    maybe_event_cb = self.maybe_dequeue()
+    self.waitable_set.num_waitables -= 1
+    self.waitable_set = to
+    self.waitable_set.num_waitables += 1
+    if maybe_event_cb:
+      self.enqueue(maybe_event_cb)
+
+  def drop(self):
+    if self.waitable_set:
+      assert(not self.maybe_dequeue())
+      self.waitable_set.num_waitables -= 1
+
+class WaitableSet:
+  num_waitables: int
+  events: list[tuple[Waitable, EventCallback]]
+  has_event: asyncio.Event
+
+  def __init__(self):
+    self.num_waitables = 0
+    self.events = []
+    self.has_event = asyncio.Event()
+
+  def empty(self):
+    assert(self.num_waitables > 0 or not self.events)
+    return self.num_waitables == 0
+
+  async def wait(self) -> EventTuple:
+    while True:
+      await self.has_event.wait()
+      if (event := self.poll()):
+        return event
+
+  def poll(self) -> Optional[EventTuple]:
+    while self.events:
+      assert(self.has_event.is_set())
+      _,event_cb = self.events.pop(0)
+      if not self.events:
+        self.has_event.clear()
+      if (event := event_cb()):
+        return event
+    return None
+
+#### Suspend / Resume Emulation
+
 OnBlockCallback = Callable[[Awaitable], Awaitable]
 
 current_task = asyncio.Lock()
@@ -342,6 +413,8 @@ async def call_and_handle_blocking(callee, *args) -> Blocked|Returned:
   asyncio.create_task(do_call())
   return await ret
 
+#### Task State
+
 class Task:
   opts: CanonicalOptions
   inst: ComponentInstance
@@ -349,8 +422,6 @@ class Task:
   caller: Optional[Task]
   on_return: Optional[Callable]
   on_block: OnBlockCallback
-  events: list[EventCallback]
-  has_events: asyncio.Event
   num_subtasks: int
   num_borrows: int
 
@@ -361,8 +432,6 @@ class Task:
     self.caller = caller
     self.on_return = on_return
     self.on_block = on_block
-    self.events = []
-    self.has_events = asyncio.Event()
     self.num_subtasks = 0
     self.num_borrows = 0
 
@@ -388,7 +457,7 @@ class Task:
       assert(self.inst.interruptible.is_set())
       self.inst.interruptible.clear()
     self.inst.num_tasks += 1
-    cx = LiftLowerContext(self.opts, self.inst, self)
+    cx = LiftLowerContext(self.opts, self.inst, self, TODO)
     return lower_flat_values(cx, MAX_FLAT_PARAMS, on_start(), self.ft.param_types())
 
   def may_enter(self, pending_task):
@@ -427,32 +496,15 @@ class Task:
     else:
       await callee(*args, self.on_block)
 
-  async def wait(self, sync) -> EventTuple:
-    while True:
-      await self.wait_on(sync, self.has_events.wait())
-      if (e := self.maybe_next_event()):
-        return e
-
-  def maybe_next_event(self) -> Optional[EventTuple]:
-    while self.events:
-      assert(self.has_events.is_set())
-      event = self.events.pop(0)
-      if not self.events:
-        self.has_events.clear()
-      if (e := event()):
-        return e
-    return None
-
-  def notify(self, event: EventCallback):
-    self.events.append(event)
-    self.has_events.set()
+  async def wait(self, sync, waitable_set) -> EventTuple:
+    await self.wait_on(sync, waitable_set.wait())
 
   async def yield_(self, sync):
     await self.wait_on(sync, asyncio.sleep(0))
 
-  async def poll(self, sync) -> Optional[EventTuple]:
+  async def poll(self, sync, waitable_set) -> Optional[EventTuple]:
     await self.yield_(sync)
-    return self.maybe_next_event()
+    return waitable_set.poll()
 
   def return_(self, flat_results):
     trap_if(not self.on_return)
@@ -462,7 +514,7 @@ class Task:
     else:
       maxflat = MAX_FLAT_PARAMS
     ts = self.ft.result_types()
-    cx = LiftLowerContext(self.opts, self.inst, self)
+    cx = LiftLowerContext(self.opts, self.inst, self, TODO)
     vs = lift_flat_values(cx, maxflat, CoreValueIter(flat_results), ts)
     self.on_return(vs)
     self.on_return = None
@@ -470,7 +522,6 @@ class Task:
   def exit(self):
     assert(current_task.locked())
     trap_if(self.num_subtasks > 0)
-    assert(not self.maybe_next_event())
     trap_if(self.on_return)
     assert(self.num_borrows == 0)
     trap_if(self.inst.num_tasks == 1 and self.inst.backpressure)
@@ -481,14 +532,17 @@ class Task:
       self.inst.interruptible.set()
     self.maybe_start_pending_task()
 
-class Subtask:
+#### Subtask State
+
+class Subtask(Waitable):
   supertask: Task
   state: CallState
   lenders: list[ResourceHandle]
   enqueued: bool
   finished: bool
 
-  def __init__(self,  task):
+  def __init__(self, task):
+    Waitable.__init__(self)
     self.supertask = task
     self.state = CallState.STARTING
     self.lenders = []
@@ -514,6 +568,7 @@ class Subtask:
     assert(self.state == CallState.RETURNED)
     assert(not self.enqueued)
     self.supertask.num_subtasks -= 1
+    Waitable.drop(self)
 
 #### Buffer, Stream and Future State
 
@@ -635,35 +690,21 @@ class ReadableStreamGuestImpl(ReadableStream):
     else:
       assert(not self.other_buffer and not self.other_future)
 
-class StreamHandle:
+class StreamHandle(Waitable):
   stream: ReadableStream
   t: ValType
-  paired: bool
-  copying_task: Optional[Task]
   copying_buffer: Optional[Buffer]
 
   def __init__(self, stream, t):
+    Waitable.__init__(self)
     self.stream = stream
     self.t = t
-    self.paired = False
-    self.copying_task = None
-    self.copying_buffer = None
-
-  def start_copying(self, task, buffer):
-    assert(not self.copying_task and not self.copying_buffer)
-    task.num_subtasks += 1
-    self.copying_task = task
-    self.copying_buffer = buffer
-
-  def stop_copying(self):
-    assert(self.copying_task and self.copying_buffer)
-    self.copying_task.num_subtasks -= 1
-    self.copying_task = None
     self.copying_buffer = None
 
   def drop(self, errctx):
     trap_if(self.copying_buffer)
     self.stream.close(errctx)
+    Waitable.drop(self)
 
 class ReadableStreamHandle(StreamHandle):
   async def copy(self, dst, on_block):
@@ -1051,8 +1092,8 @@ def lift_async_value(ReadableHandleT, WritableHandleT, cx, i, t):
       trap_if(h.copying_buffer)
       cx.inst.waitables.remove(i)
     case WritableHandleT():
-      trap_if(h.paired)
-      h.paired = True
+      trap_if(h.waitable_set)
+      h.init_waitable_set(cx.waitable_set)
     case _:
       trap()
   trap_if(h.t != t)
@@ -1360,14 +1401,14 @@ def lower_async_value(ReadableHandleT, WritableHandleT, cx, v, t):
   assert(not contains_borrow(t))
   if isinstance(v, ReadableStreamGuestImpl) and cx.inst is v.impl:
     [h] = [h for h in cx.inst.waitables.array if h and h.stream is v]
-    assert(h.paired)
-    h.paired = False
+    assert(h.waitable_set)
+    h.waitable_set = None # TODO: nope!
     i = cx.inst.waitables.array.index(h)
     assert(2**31 > Table.MAX_LENGTH >= i)
     return i | (2**31)
   else:
     h = ReadableHandleT(v, t)
-    h.paired = True
+    h.init_waitable_set(cx.waitable_set)
     return cx.inst.waitables.add(h)
 
 ### Flattening
@@ -1730,7 +1771,7 @@ async def call_and_trap_on_throw(callee, task, args):
 async def canon_lower(opts, ft, callee, task, flat_args):
   trap_if(not task.inst.may_leave)
   subtask = Subtask(task)
-  cx = LiftLowerContext(opts, task.inst, subtask)
+  cx = LiftLowerContext(opts, task.inst, subtask, TODO)
 
   flat_ft = flatten_functype(opts, ft, 'lower')
   assert(types_match_values(flat_ft.params, flat_args))
@@ -1757,6 +1798,7 @@ async def canon_lower(opts, ft, callee, task, flat_args):
     subtask.finish()
     assert(types_match_values(flat_ft.results, flat_results))
   else:
+    waitable_set = task.inst.waitable_sets.get(flag_args.next('i32'))
     max_flat_params = 1
     max_flat_results = 0
     _ = await call_and_handle_blocking(callee, task, on_start, on_return)
@@ -1766,6 +1808,7 @@ async def canon_lower(opts, ft, callee, task, flat_args):
         flat_results = [0]
       case _:
         task.num_subtasks += 1
+        subtask.init_waitable_set(waitable_set)
         subtaski = task.inst.waitables.add(subtask)
         def on_progress():
           if not subtask.enqueued:
@@ -1775,7 +1818,7 @@ async def canon_lower(opts, ft, callee, task, flat_args):
               if subtask.state == CallState.RETURNED:
                 subtask.finish()
               return (EventCode(subtask.state), subtaski, 0)
-            task.notify(subtask_event)
+            subtask.enqueue(subtask_event)
         assert(0 < subtaski <= Table.MAX_LENGTH < 2**30)
         assert(0 <= int(subtask.state) < 2**2)
         flat_results = [subtaski | (int(subtask.state) << 30)]
@@ -1824,6 +1867,30 @@ async def canon_resource_rep(rt, task, i):
   trap_if(h.rt is not rt)
   return [h.rep]
 
+### 🔀 `canon waitable-set.new`
+
+async def canon_waitable_set_new(task):
+  trap_if(not task.inst.may_leave)
+  return [ task.inst.waitable_sets.add(WaitableSet()) ]
+
+### 🔀 `canon waitable-set.drop`
+
+async def canon_waitable_set_drop(task, i):
+  trap_if(not task.inst.may_leave)
+  waitable_set = task.inst.waitable_sets.remove(i)
+  trap_if(not waitable_set.empty())
+  return []
+
+### 🔀 `canon waitable-set.adopt`
+
+async def canon_waitable_set_adopt(task, wsi, wi):
+  trap_if(not task.inst.may_leave)
+  waitable_set = task.inst.waitable_sets.get(wsi)
+  w = task.inst.waitables.get(wi)
+  trap_if(waitable_set is w.waitable_set)
+  w.move(waitable_set)
+  return []
+
 ### 🔀 `canon task.backpressure`
 
 async def canon_task_backpressure(task, flat_args):
@@ -1844,9 +1911,10 @@ async def canon_task_return(task, core_ft, flat_args):
 
 ### 🔀 `canon task.wait`
 
-async def canon_task_wait(sync, mem, task, ptr):
+async def canon_task_wait(sync, mem, task, wsi, ptr):
   trap_if(not task.inst.may_leave)
-  event, p1, p2 = await task.wait(sync)
+  waitable_set = task.inst.waitable_sets.get(wsi)
+  event, p1, p2 = await task.wait(sync, waitable_set)
   cx = LiftLowerContext(CanonicalOptions(memory = mem), task.inst)
   store(cx, p1, U32Type(), ptr)
   store(cx, p2, U32Type(), ptr + 4)
@@ -1854,9 +1922,9 @@ async def canon_task_wait(sync, mem, task, ptr):
 
 ### 🔀 `canon task.poll`
 
-async def canon_task_poll(sync, mem, task, ptr):
+async def canon_task_poll(sync, mem, task, wsi, ptr):
   trap_if(not task.inst.may_leave)
-  ret = await task.poll(sync)
+  ret = await task.poll(sync, waitable_set)
   if ret is None:
     return [0]
   cx = LiftLowerContext(CanonicalOptions(memory = mem), task.inst)
@@ -1915,14 +1983,14 @@ async def async_copy(HandleT, BufferT, t, opts, event_code, task, i, ptr, n):
   trap_if(not isinstance(h, HandleT))
   trap_if(h.t != t)
   trap_if(h.copying_buffer)
+  # TODO: trap_if(not h.waitable_set)?
   assert(not contains_borrow(t))
-  cx = LiftLowerContext(opts, task.inst, borrow_scope = None)
+  cx = LiftLowerContext(opts, task.inst, None, h.waitable_set)
   buffer = BufferT(cx, t, ptr, n)
   if h.stream.closed():
     flat_results = [pack_async_copy_result(task, buffer, h)]
   else:
     if opts.sync:
-      trap_if(not h.paired)
       await task.call_sync(h.copy, buffer)
       flat_results = [pack_async_copy_result(task, buffer, h)]
     else:
@@ -1931,14 +1999,14 @@ async def async_copy(HandleT, BufferT, t, opts, event_code, task, i, ptr, n):
         if h.copying_buffer is buffer:
           def copy_event():
             if h.copying_buffer is buffer:
-              h.stop_copying()
+              h.copying_buffer = None
               return (event_code, i, pack_async_copy_result(task, buffer, h))
             else:
               return None
-          task.notify(copy_event)
+          h.enqueue(copy_event)
       match await call_and_handle_blocking(do_copy):
         case Blocked():
-          h.start_copying(task, buffer)
+          h.copying_buffer = buffer
           flat_results = [BLOCKED]
         case Returned():
           flat_results = [pack_async_copy_result(task, buffer, h)]
@@ -1987,19 +2055,19 @@ async def cancel_async_copy(HandleT, t, sync, task, i):
   trap_if(not h.copying_buffer)
   if h.stream.closed():
     flat_results = [pack_async_copy_result(task, h.copying_buffer, h)]
-    h.stop_copying()
+    h.copying_buffer = None
   else:
     if sync:
       await task.call_sync(h.cancel_copy, h.copying_buffer)
       flat_results = [pack_async_copy_result(task, h.copying_buffer, h)]
-      h.stop_copying()
+      h.copying_buffer = None
     else:
       match await call_and_handle_blocking(h.cancel_copy, h.copying_buffer):
         case Blocked():
           flat_results = [BLOCKED]
         case Returned():
           flat_results = [pack_async_copy_result(task, h.copying_buffer, h)]
-          h.stop_copying()
+          h.copying_buffer = None
   return flat_results
 
 ### 🔀 `canon {stream,future}.close-{readable,writable}`
